@@ -1,101 +1,125 @@
 import torch
+import pandas as pd
 import argparse
 import os
-from utils.utils import url_to_tensor, decode_tensor, VOCAB_SIZE
-from models.models import CharCNN, CharLSTM
+import sys
+from utils.utils import url_to_tensor, VOCAB_SIZE
+from models.models_optuna import CharCNN, CharLSTM 
 
-# Configuração do Dispositivo
+# --- CONFIGURAÇÕES ---
+MODEL_VERSION = 100
+MODEL_TYPE = "CNN"
+BENIGN_IDX = 1 
+CLASS_MAP = {0: 'Phishing', 1: 'Benign', 2: 'Defacement', 3: 'Malware'}
+CSV_PATH_CNN = f"results/optuna_results_{MODEL_TYPE.lower()}_{MODEL_VERSION}.csv"
+MODEL_PATH_CNN = f"checkpoints/urlifeguard_FINAL_{MODEL_TYPE.lower()}_{MODEL_VERSION}.pth"
+CSV_PATH_LSTM = f"results/optuna_results_{MODEL_TYPE.lower()}_{MODEL_VERSION}.csv"
+MODEL_PATH_LSTM = f"checkpoints/urlifeguard_FINAL_{MODEL_TYPE.lower()}_{MODEL_VERSION}.pth"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Usando dispositivo: {device}")
 
-def load_model(model_path, model_type="CNN"):
+def load_model(model_type: str):
+    model_type = model_type.lower()
     """
-    Carrega o modelo treinado (.pth) e prepara para inferência.
+    Lê o CSV do Optuna para reconstruir a arquitetura exata do modelo
+    e depois carrega os pesos.
     """
-    if not os.path.exists(model_path):
-        print(f"ERRO: Modelo não encontrado em {model_path}")
-        return None
+    csv_path = CSV_PATH_CNN if model_type == "cnn" else CSV_PATH_LSTM
+    model_path = MODEL_PATH_CNN if model_type == "cnn" else MODEL_PATH_LSTM
 
-    print(f"Carregando modelo {model_type} de {model_path}...")
-    
-    # Instanciar a arquitetura correta
-    # Nota: num_classes deve ser o mesmo usado no treino (geralmente 2)
-    if model_type == "CNN":
-        model = CharCNN(vocab_size=VOCAB_SIZE, num_classes=2)
-    elif model_type == "LSTM":
-        model = CharLSTM(vocab_size=VOCAB_SIZE, num_classes=2)
-    else:
-        print("Tipo de modelo desconhecido.")
-        return None
-        
-    # Carregar os pesos treinados
-    # map_location garante que carregue na CPU se não houver GPU disponível
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.to(device)
-    model.eval() # Modo de avaliação (desliga dropout, etc)
-    
-    return model
+    if not os.path.exists(csv_path) or not os.path.exists(model_path):
+        raise FileNotFoundError(f"❌ ERRO: Arquivos não encontrados.\nCSV: {csv_path}\nModel: {model_path}")
 
-def predict_url(model, url_string):
-    """
-    Recebe uma string de URL e retorna a predição (Benigno/Malicioso)
-    e a confiança (probabilidade).
-    """
-    # Pré-processamento: Converter string para tensor
-    # Adiciona dimensão do batch (1, 150)
-    tensor = url_to_tensor(url_string, max_len=150).unsqueeze(0).to(device)
+    try:
+        # 1. Ler CSV e pegar a melhor configuração
+        df = pd.read_csv(csv_path)
+        best_row = df.loc[df['value'].idxmax()] # Pega a linha com maior F1 Score
+
+        # 2. Instanciar o modelo com os parâmetros do CSV
+        if model_type == "cnn":
+            n_layers = int(best_row['params_n_conv_layers'].item())
+            filters_list = [int(best_row[f'params_n_filter_l{i}'].item()) for i in range(n_layers)]
+            
+            model = CharCNN(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=int(best_row['params_embed_dim'].item()),
+                n_filters=filters_list,
+                kernel_sizes=int(best_row['params_kernel_sizes'].item()),
+                fc_dim=int(best_row['params_fc_dim'].item()),
+                dropout=float(best_row['params_dropout'].item()),
+                num_classes=4 
+            )
+        else: # LSTM
+            model = CharLSTM(
+                vocab_size=VOCAB_SIZE,
+                embed_dim=int(best_row['params_embed_dim'].item()),
+                hidden_dim=int(best_row['params_hidden_dim'].item()),
+                n_layers=int(best_row['params_n_layers'].item()),
+                dropout=float(best_row['params_dropout'].item()),
+                num_classes=4
+            )
+
+        # 3. Carregar pesos
+        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.to(device)
+        model.eval()
+        return model
+
+    except Exception as e:
+        print(f"❌ Erro ao reconstruir o modelo: {e}")
+        print("Verifique se o arquivo CSV corresponde ao modelo .pth que você está tentando carregar.")
+        sys.exit(1)
+
+def predict(model, url):
+    # Processamento
+    tensor = url_to_tensor(url, max_len=150).unsqueeze(0).to(device)
     
     with torch.no_grad():
         outputs = model(tensor)
-        # Aplicar Softmax para ter probabilidades (0 a 1)
         probs = torch.nn.functional.softmax(outputs, dim=1)
         
-        # Pegar a classe com maior probabilidade
-        confidence, predicted_class = torch.max(probs, 1)
+        # Pega a classe predita
+        conf, pred_idx_tensor = torch.max(probs, 1)
+        pred_idx = int(pred_idx_tensor.item())
         
-    return predicted_class.item(), confidence.item()
+        # Lógica Binária (Benigno vs O Resto)
+        is_malicious = (pred_idx != BENIGN_IDX)
+        
+        # Se for malicioso, a confiança é a soma das chances de ser ruim
+        # Ou simplesmente 1 - chance de ser bom
+        if is_malicious:
+            confidence = 1.0 - probs[0][BENIGN_IDX].item()
+        else:
+            confidence = probs[0][BENIGN_IDX].item()
+
+        label_specific = CLASS_MAP.get(pred_idx, "Unknown")
+        
+        return is_malicious, label_specific, confidence
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="URLifeguard: Verificador de URLs")
-    parser.add_argument("--url", type=str, help="URL para verificar (ex: www.google.com)")
-    parser.add_argument("--model_path", type=str, default="checkpoints/urlifeguard_cnn.pth", help="Caminho para o arquivo .pth do modelo")
-    parser.add_argument("--type", type=str, default="CNN", choices=["CNN", "LSTM"], help="Tipo do modelo (CNN ou LSTM)")
+    parser = argparse.ArgumentParser(description="Verificador de URL via Terminal")
+    parser.add_argument("--url", type=str, required=True, help="A URL para analisar")
+    parser.add_argument("--type", type=str, default="CNN", choices=["CNN", "LSTM"], help="Qual modelo usar")
     
     args = parser.parse_args()
     
-    # Carregar o cérebro
-    model = load_model(args.model_path, args.type)
+    # 1. Carrega
+    print(f"🔍 Carregando modelo {args.type}...")
+    model = load_model(args.type)
     
-    if model:
-        # Se o usuário passou uma URL via linha de comando
-        if args.url:
-            urls_to_check = [args.url]
-        else:
-            # Modo interativo
-            print("\n--- URLifeguard Firewall Simulado ---")
-            print("Digite uma URL para verificar (ou 'q' para sair)")
-            urls_to_check = []
-            while True:
-                user_input = input("\nURL > ")
-                if user_input.lower() == 'q':
-                    break
-                
-                label, conf = predict_url(model, user_input)
-                
-                # Mapeamento (0 = Benigno, 1 = Malicioso - ajuste conforme seu treino!)
-                status = "🛡️ SEGURA" if label == 0 else "☣️ MALICIOSA"
-                color = "\033[92m" if label == 0 else "\033[91m" # Verde ou Vermelho
-                reset = "\033[0m"
-                
-                print(f"Resultado: {color}{status}{reset}")
-                print(f"Confiança: {conf*100:.2f}%")
-
-        # Caso tenha passado argumento --url, roda só uma vez
-        if args.url:
-            label, conf = predict_url(model, args.url)
-            status = "🛡️ SEGURA" if label == 0 else "☣️ MALICIOSA"
-            color = "\033[92m" if label == 0 else "\033[91m" # Verde ou Vermelho
-            reset = "\033[0m"
-            
-            print(f"Resultado: {color}{status}{reset}")
-            print(f"Confiança: {conf*100:.2f}%")
+    # 2. Prediz
+    is_malicious, specific_label, conf = predict(model, args.url)
+    
+    # 3. Exibe Resultado
+    print("-" * 30)
+    print(f"URL: {args.url}")
+    
+    if is_malicious:
+        # Vermelho para perigo
+        print(f"Resultado: \033[91m☣️  MALICIOSO\033[0m")
+        print(f"Tipo Detectado: {specific_label}")
+    else:
+        # Verde para seguro
+        print(f"Resultado: \033[92m🛡️  BENIGNO\033[0m")
+        
+    print(f"Confiança: {conf*100:.2f}%")
+    print("-" * 30)
