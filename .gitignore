@@ -213,6 +213,6 @@ checkpoints/
 
 *.csv
 
-db.sqlite
+db.*
 
 
